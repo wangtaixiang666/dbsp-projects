@@ -37,105 +37,100 @@ BufferPoolManagerInstance::~BufferPoolManagerInstance() {
   delete replacer_;
 }
 
-auto BufferPoolManagerInstance::AcquireFrame(frame_id_t *frame_id) -> bool {
+auto BufferPoolManagerInstance::NewPgImp(page_id_t *page_id) -> Page * {
+  std::scoped_lock<std::mutex> lock(latch_);
+
+  // Prefer a frame that has never held a page; only fall back to eviction when the
+  // free list is drained. Evict() returns false when every frame is still pinned.
+  frame_id_t frame_id = -1;
   if (!free_list_.empty()) {
-    *frame_id = free_list_.front();
+    frame_id = free_list_.front();
     free_list_.pop_front();
-    return true;
+  } else if (!replacer_->Evict(&frame_id)) {
+    return nullptr;
   }
 
-  // No free frame left: ask the replacer for a victim. This fails only when every
-  // frame is still pinned.
-  if (!replacer_->Evict(frame_id)) {
-    return false;
-  }
+  auto *page = &pages_[frame_id];
 
-  Page *page = &pages_[*frame_id];
+  // Whatever used to live in this frame must reach the disk before we overwrite it.
   if (page->IsDirty()) {
     disk_manager_->WritePage(page->GetPageId(), page->GetData());
   }
   if (page->GetPageId() != INVALID_PAGE_ID) {
     page_table_->Remove(page->GetPageId());
   }
-  return true;
-}
 
-auto BufferPoolManagerInstance::NewPgImp(page_id_t *page_id) -> Page * {
-  if (page_id != nullptr) {
-    *page_id = INVALID_PAGE_ID;
-  }
-  std::scoped_lock<std::mutex> lock(latch_);
-
-  frame_id_t frame_id;
-  if (!AcquireFrame(&frame_id)) {
-    return nullptr;
-  }
-
-  Page *page = &pages_[frame_id];
-  page->ResetMemory();
+  // A brand-new page: untouched memory, pinned once, clean.
   page->page_id_ = AllocatePage();
   page->pin_count_ = 1;
   page->is_dirty_ = false;
+  page->ResetMemory();
 
   page_table_->Insert(page->page_id_, frame_id);
+  // Record the access first, then pin: SetEvictable(false) is what keeps the frame from
+  // being picked as a victim before this caller unpins it.
   replacer_->RecordAccess(frame_id);
-  // Pin the frame so the replacer cannot take it back before it is unpinned.
   replacer_->SetEvictable(frame_id, false);
 
-  if (page_id != nullptr) {
-    *page_id = page->page_id_;
-  }
+  *page_id = page->page_id_;
   return page;
 }
 
 auto BufferPoolManagerInstance::FetchPgImp(page_id_t page_id) -> Page * {
   std::scoped_lock<std::mutex> lock(latch_);
 
-  // Cache hit: just pin the frame again and refresh its access history.
-  frame_id_t frame_id;
+  frame_id_t frame_id = -1;
   if (page_table_->Find(page_id, frame_id)) {
-    Page *page = &pages_[frame_id];
+    // Cache hit: just pin it again and refresh its access history.
+    auto *page = &pages_[frame_id];
     page->pin_count_++;
     replacer_->RecordAccess(frame_id);
     replacer_->SetEvictable(frame_id, false);
     return page;
   }
 
-  // Cache miss: materialise the page in a reusable frame.
-  if (!AcquireFrame(&frame_id)) {
+  if (!free_list_.empty()) {
+    frame_id = free_list_.front();
+    free_list_.pop_front();
+  } else if (!replacer_->Evict(&frame_id)) {
     return nullptr;
   }
 
-  Page *page = &pages_[frame_id];
-  page->ResetMemory();
+  auto *page = &pages_[frame_id];
+  if (page->IsDirty()) {
+    disk_manager_->WritePage(page->GetPageId(), page->GetData());
+  }
+  if (page->GetPageId() != INVALID_PAGE_ID) {
+    page_table_->Remove(page->GetPageId());
+  }
+
+  disk_manager_->ReadPage(page_id, page->GetData());
   page->page_id_ = page_id;
   page->pin_count_ = 1;
   page->is_dirty_ = false;
-  disk_manager_->ReadPage(page_id, page->GetData());
 
   page_table_->Insert(page_id, frame_id);
   replacer_->RecordAccess(frame_id);
   replacer_->SetEvictable(frame_id, false);
-
   return page;
 }
 
 auto BufferPoolManagerInstance::UnpinPgImp(page_id_t page_id, bool is_dirty) -> bool {
   std::scoped_lock<std::mutex> lock(latch_);
 
-  frame_id_t frame_id;
+  frame_id_t frame_id = -1;
   if (!page_table_->Find(page_id, frame_id)) {
     return false;
   }
 
-  Page *page = &pages_[frame_id];
+  auto *page = &pages_[frame_id];
   if (page->pin_count_ <= 0) {
     return false;
   }
 
   page->pin_count_--;
-  // The dirty flag is only ever raised here; once set it stays set until the page is
-  // written back (or the frame is recycled).
+  // The dirty bit is sticky: unpinning with is_dirty = false never clears it, otherwise a
+  // caller that modified the page and then unpinned with false would silently lose writes.
   if (is_dirty) {
     page->is_dirty_ = true;
   }
@@ -148,12 +143,13 @@ auto BufferPoolManagerInstance::UnpinPgImp(page_id_t page_id, bool is_dirty) -> 
 auto BufferPoolManagerInstance::FlushPgImp(page_id_t page_id) -> bool {
   std::scoped_lock<std::mutex> lock(latch_);
 
-  frame_id_t frame_id;
+  frame_id_t frame_id = -1;
   if (!page_table_->Find(page_id, frame_id)) {
     return false;
   }
 
-  Page *page = &pages_[frame_id];
+  auto *page = &pages_[frame_id];
+  // Flush unconditionally: the caller may want a durable copy even of a clean page.
   disk_manager_->WritePage(page_id, page->GetData());
   page->is_dirty_ = false;
   return true;
@@ -162,40 +158,40 @@ auto BufferPoolManagerInstance::FlushPgImp(page_id_t page_id) -> bool {
 void BufferPoolManagerInstance::FlushAllPgsImp() {
   std::scoped_lock<std::mutex> lock(latch_);
 
-  for (size_t i = 0; i < pool_size_; ++i) {
-    Page *page = &pages_[i];
-    if (page->GetPageId() == INVALID_PAGE_ID) {
-      continue;
+  for (size_t i = 0; i < pool_size_; i++) {
+    auto *page = &pages_[i];
+    if (page->GetPageId() != INVALID_PAGE_ID) {
+      disk_manager_->WritePage(page->GetPageId(), page->GetData());
+      page->is_dirty_ = false;
     }
-    disk_manager_->WritePage(page->GetPageId(), page->GetData());
-    page->is_dirty_ = false;
   }
 }
 
 auto BufferPoolManagerInstance::DeletePgImp(page_id_t page_id) -> bool {
   std::scoped_lock<std::mutex> lock(latch_);
 
-  frame_id_t frame_id;
+  frame_id_t frame_id = -1;
   if (!page_table_->Find(page_id, frame_id)) {
-    // Nothing buffered for this page, the deletion is trivially satisfied.
+    // Not in the pool means there is nothing to clean up.
     return true;
   }
 
-  Page *page = &pages_[frame_id];
+  auto *page = &pages_[frame_id];
   if (page->pin_count_ > 0) {
     return false;
   }
 
-  // The frame is unpinned, so it is registered as evictable in the replacer.
-  replacer_->Remove(frame_id);
   page_table_->Remove(page_id);
+  // pin_count_ == 0 means Unpin already made the frame evictable, which is what
+  // LRUKReplacer::Remove requires.
+  replacer_->Remove(frame_id);
+  free_list_.push_back(frame_id);
 
-  page->ResetMemory();
+  // The page is being thrown away: reset the frame without writing anything back.
   page->page_id_ = INVALID_PAGE_ID;
   page->pin_count_ = 0;
   page->is_dirty_ = false;
-
-  free_list_.push_back(frame_id);
+  page->ResetMemory();
   DeallocatePage(page_id);
   return true;
 }

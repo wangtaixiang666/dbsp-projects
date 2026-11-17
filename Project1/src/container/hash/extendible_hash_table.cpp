@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <functional>
 #include <list>
+#include <memory>
 #include <utility>
 
 #include "container/hash/extendible_hash_table.h"
@@ -23,13 +24,14 @@ namespace bustub {
 
 template <typename K, typename V>
 ExtendibleHashTable<K, V>::ExtendibleHashTable(size_t bucket_size) : bucket_size_(bucket_size) {
-  // Start with one bucket of local depth 0 and a directory of size 2^0 = 1.
-  dir_.push_back(std::make_shared<Bucket>(bucket_size_, global_depth_));
+  // The directory starts with exactly one bucket of local depth 0 referenced by index 0.
+  // Leaving dir_ empty here would make every GetLocalDepth(0)/Find() dereference nothing.
+  dir_.push_back(std::make_shared<Bucket>(bucket_size_, 0));
 }
 
 template <typename K, typename V>
 auto ExtendibleHashTable<K, V>::IndexOf(const K &key) -> size_t {
-  int mask = (1 << global_depth_) - 1;
+  const size_t mask = global_depth_ == 0 ? size_t{0} : ((size_t{1} << global_depth_) - 1);
   return std::hash<K>()(key) & mask;
 }
 
@@ -69,72 +71,68 @@ auto ExtendibleHashTable<K, V>::GetNumBucketsInternal() const -> int {
 template <typename K, typename V>
 auto ExtendibleHashTable<K, V>::Find(const K &key, V &value) -> bool {
   std::scoped_lock<std::mutex> lock(latch_);
-  const size_t index = IndexOf(key);
-  return dir_[index]->Find(key, value);
+  return dir_[IndexOf(key)]->Find(key, value);
 }
 
 template <typename K, typename V>
 auto ExtendibleHashTable<K, V>::Remove(const K &key) -> bool {
   std::scoped_lock<std::mutex> lock(latch_);
-  const size_t index = IndexOf(key);
-  return dir_[index]->Remove(key);
+  return dir_[IndexOf(key)]->Remove(key);
 }
 
 template <typename K, typename V>
 void ExtendibleHashTable<K, V>::Insert(const K &key, const V &value) {
   std::scoped_lock<std::mutex> lock(latch_);
-  // Keep trying: a single split is not guaranteed to make room, because all the
-  // entries of the bucket may still share the same prefix after redistribution.
+
+  // After a split the key may still land in a full bucket (all keys sharing the same
+  // low bits), so keep splitting until the insert finally succeeds.
   while (true) {
-    const size_t index = IndexOf(key);
-    std::shared_ptr<Bucket> bucket = dir_[index];
+    auto bucket = dir_[IndexOf(key)];
+
+    // Either the key was inserted, or its value was replaced in place.
     if (bucket->Insert(key, value)) {
       return;
     }
+
+    // The bucket is full and the key is new, so it must be split.
+    if (bucket->GetDepth() == GetGlobalDepthInternal()) {
+      // Local depth == global depth: the directory has to double first, otherwise the
+      // extra bit of the new local depth could not be addressed.
+      const size_t old_size = dir_.size();
+      dir_.reserve(old_size * 2);
+      for (size_t i = 0; i < old_size; i++) {
+        dir_.push_back(dir_[i]);
+      }
+      global_depth_++;
+    }
+
+    // Split off a new bucket: both halves get local depth = old depth + 1, and the bit at
+    // position (new_depth - 1) decides which half a directory slot belongs to.
+    const int new_depth = bucket->GetDepth() + 1;
+    auto new_bucket = std::make_shared<Bucket>(bucket_size_, new_depth);
+    bucket->IncrementDepth();
+
+    const size_t split_bit = size_t{1} << (new_depth - 1);
+    for (size_t i = 0; i < dir_.size(); i++) {
+      if (dir_[i] == bucket && (i & split_bit) != 0) {
+        dir_[i] = new_bucket;
+      }
+    }
+    num_buckets_++;
+
+    // Push every key-value pair back through the (now deeper) directory.
     RedistributeBucket(bucket);
   }
 }
 
 template <typename K, typename V>
 auto ExtendibleHashTable<K, V>::RedistributeBucket(std::shared_ptr<Bucket> bucket) -> void {
-  // Step 1: the bucket already consumes every bit of the directory index, so the
-  // directory has to grow first (global depth + 1, directory size doubled).
-  if (bucket->GetDepth() == global_depth_) {
-    const size_t old_size = dir_.size();
-    ++global_depth_;
-    dir_.reserve(old_size * 2);
-    for (size_t i = 0; i < old_size; ++i) {
-      dir_.push_back(dir_[i]);
-    }
-  }
-
-  // Step 2: increment the local depth of the bucket being split.
-  bucket->IncrementDepth();
-  const int depth = bucket->GetDepth();
-  const size_t split_bit = static_cast<size_t>(1) << (depth - 1);
-
-  // Step 3: create a sibling bucket and move over the entries whose hash has the
-  // newly significant bit set.
-  auto new_bucket = std::make_shared<Bucket>(bucket_size_, depth);
-  ++num_buckets_;
-
-  auto &old_items = bucket->GetItems();
-  auto &new_items = new_bucket->GetItems();
-  for (auto it = old_items.begin(); it != old_items.end();) {
-    if ((std::hash<K>()(it->first) & split_bit) != 0) {
-      new_items.push_back(*it);
-      it = old_items.erase(it);
-    } else {
-      ++it;
-    }
-  }
-
-  // Step 4: re-point the directory entries that used to share this bucket.
-  // Entries whose index has the split bit set now belong to the new bucket.
-  for (size_t i = 0; i < dir_.size(); ++i) {
-    if (dir_[i] == bucket && (i & split_bit) != 0) {
-      dir_[i] = new_bucket;
-    }
+  auto items = std::move(bucket->GetItems());
+  bucket->GetItems().clear();
+  for (auto &item : items) {
+    // push_back on purpose: the target bucket may temporarily hold more than bucket_size_
+    // entries, which is exactly what triggers another split on the next Insert attempt.
+    dir_[IndexOf(item.first)]->GetItems().push_back(std::move(item));
   }
 }
 
@@ -146,7 +144,7 @@ ExtendibleHashTable<K, V>::Bucket::Bucket(size_t array_size, int depth) : size_(
 
 template <typename K, typename V>
 auto ExtendibleHashTable<K, V>::Bucket::Find(const K &key, V &value) -> bool {
-  for (auto &item : list_) {
+  for (const auto &item : list_) {
     if (item.first == key) {
       value = item.second;
       return true;
@@ -170,12 +168,13 @@ template <typename K, typename V>
 auto ExtendibleHashTable<K, V>::Bucket::Insert(const K &key, const V &value) -> bool {
   for (auto &item : list_) {
     if (item.first == key) {
-      // Overwriting an existing key never needs additional space.
       item.second = value;
       return true;
     }
   }
-  if (IsFull()) {
+  // Use >= instead of IsFull() (which tests ==): a bucket can hold more than size_ entries
+  // right after a redistribution that failed to separate the colliding keys.
+  if (list_.size() >= size_) {
     return false;
   }
   list_.emplace_back(key, value);

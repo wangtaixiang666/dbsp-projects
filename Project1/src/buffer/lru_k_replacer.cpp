@@ -19,106 +19,92 @@ LRUKReplacer::LRUKReplacer(size_t num_frames, size_t k) : replacer_size_(num_fra
 auto LRUKReplacer::Evict(frame_id_t *frame_id) -> bool {
   std::scoped_lock<std::mutex> lock(latch_);
 
-  // A frame with fewer than k accesses has an infinite backward k-distance and is
-  // therefore always preferred over a frame that already has k accesses. Among the
-  // infinite ones the frame with the earliest access timestamp wins; among the
-  // others the largest backward k-distance (i.e. the smallest k-th previous
-  // timestamp, which is exactly the oldest retained timestamp) wins.
-  bool found = false;
-  frame_id_t victim = -1;
+  // Among all evictable frames pick the one with the largest backward k-distance.
+  // Frames accessed fewer than k times have an infinite distance, so they always win.
+  // Ties inside a tier are broken by the earliest timestamp (plain LRU); timestamps are
+  // globally unique, so the choice is deterministic.
+  bool has_victim = false;
   bool victim_infinite = false;
-  size_t victim_key = 0;
+  size_t victim_front_ts = 0;
+  frame_id_t victim = INVALID_PAGE_ID;
 
-  for (auto &entry : frame_status_) {
-    const frame_id_t candidate = entry.first;
-    FrameStatus &status = entry.second;
-    if (!status.evictable_) {
+  for (const auto &[fid, entry] : node_store_) {
+    if (!entry.evictable_ || entry.history_.empty()) {
       continue;
     }
-    const bool infinite = status.history_.size() < k_;
-    const size_t key = status.history_.front();
 
-    bool better = false;
-    if (!found) {
-      better = true;
-    } else if (infinite != victim_infinite) {
-      better = infinite;
-    } else if (key != victim_key) {
-      better = key < victim_key;
-    } else {
-      // Deterministic tie-break so that repeated runs behave identically.
-      better = candidate < victim;
-    }
+    const bool infinite = entry.history_.size() < k_;
+    const size_t front_ts = entry.history_.front();
 
+    // Better victim if: no victim yet, or this one is infinite while the current is not,
+    // or they sit in the same tier and this one was touched earlier.
+    const bool better =
+        !has_victim || (infinite && !victim_infinite) || (infinite == victim_infinite && front_ts < victim_front_ts);
     if (better) {
-      found = true;
-      victim = candidate;
+      has_victim = true;
       victim_infinite = infinite;
-      victim_key = key;
+      victim_front_ts = front_ts;
+      victim = fid;
     }
   }
 
-  if (!found) {
+  if (!has_victim) {
     return false;
   }
 
-  frame_status_.erase(victim);
-  --curr_size_;
-  if (frame_id != nullptr) {
-    *frame_id = victim;
-  }
+  // An evicted frame must not carry its access history into its next life.
+  node_store_.erase(victim);
+  curr_size_--;
+  *frame_id = victim;
   return true;
 }
 
 void LRUKReplacer::RecordAccess(frame_id_t frame_id) {
   std::scoped_lock<std::mutex> lock(latch_);
-  BUSTUB_ASSERT(frame_id >= 0 && static_cast<size_t>(frame_id) < replacer_size_,
-                "frame id out of range in LRUKReplacer::RecordAccess");
+  BUSTUB_ASSERT(frame_id >= 0 && static_cast<size_t>(frame_id) < replacer_size_, "invalid frame id");
 
-  FrameStatus &status = frame_status_[frame_id];
-  status.history_.push_back(current_timestamp_++);
-  if (status.history_.size() > k_) {
-    // Only the k most recent accesses influence the backward k-distance.
-    status.history_.pop_front();
+  current_timestamp_++;
+
+  auto &entry = node_store_[frame_id];
+  entry.history_.push_back(current_timestamp_);
+
+  // Only the k most recent accesses matter for the backward k-distance.
+  if (entry.history_.size() > k_) {
+    entry.history_.pop_front();
   }
 }
 
 void LRUKReplacer::SetEvictable(frame_id_t frame_id, bool set_evictable) {
   std::scoped_lock<std::mutex> lock(latch_);
-  BUSTUB_ASSERT(frame_id >= 0 && static_cast<size_t>(frame_id) < replacer_size_,
-                "frame id out of range in LRUKReplacer::SetEvictable");
+  BUSTUB_ASSERT(frame_id >= 0 && static_cast<size_t>(frame_id) < replacer_size_, "invalid frame id");
 
-  auto it = frame_status_.find(frame_id);
-  if (it == frame_status_.end()) {
-    // Unknown frame (never accessed): nothing to toggle.
+  auto it = node_store_.find(frame_id);
+  if (it == node_store_.end() || it->second.evictable_ == set_evictable) {
+    // Unknown frame, or already in the requested state: nothing to do.
     return;
   }
-  if (it->second.evictable_ == set_evictable) {
-    return;
-  }
+
   it->second.evictable_ = set_evictable;
   if (set_evictable) {
-    ++curr_size_;
+    curr_size_++;
   } else {
-    --curr_size_;
+    curr_size_--;
   }
 }
 
 void LRUKReplacer::Remove(frame_id_t frame_id) {
   std::scoped_lock<std::mutex> lock(latch_);
-  BUSTUB_ASSERT(frame_id >= 0 && static_cast<size_t>(frame_id) < replacer_size_,
-                "frame id out of range in LRUKReplacer::Remove");
+  BUSTUB_ASSERT(frame_id >= 0 && static_cast<size_t>(frame_id) < replacer_size_, "invalid frame id");
 
-  auto it = frame_status_.find(frame_id);
-  if (it == frame_status_.end()) {
+  auto it = node_store_.find(frame_id);
+  if (it == node_store_.end()) {
     return;
   }
-  if (!it->second.evictable_) {
-    // A pinned frame must not be discarded by the caller; leave it untouched.
-    return;
-  }
-  frame_status_.erase(it);
-  --curr_size_;
+
+  BUSTUB_ASSERT(it->second.evictable_, "cannot remove a non-evictable frame");
+
+  node_store_.erase(it);
+  curr_size_--;
 }
 
 auto LRUKReplacer::Size() -> size_t {

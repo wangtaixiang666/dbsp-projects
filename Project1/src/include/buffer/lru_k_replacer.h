@@ -12,7 +12,6 @@
 
 #pragma once
 
-#include <deque>
 #include <limits>
 #include <list>
 #include <mutex>  // NOLINT
@@ -38,9 +37,6 @@ namespace bustub {
 class LRUKReplacer {
  public:
   /**
-   *
-   * TODO(P1): Add implementation
-   *
    * @brief a new LRUKReplacer.
    * @param num_frames the maximum number of frames the LRUReplacer will be required to store
    */
@@ -49,15 +45,11 @@ class LRUKReplacer {
   DISALLOW_COPY_AND_MOVE(LRUKReplacer);
 
   /**
-   * TODO(P1): Add implementation
-   *
    * @brief Destroys the LRUReplacer.
    */
   ~LRUKReplacer() = default;
 
   /**
-   * TODO(P1): Add implementation
-   *
    * @brief Find the frame with largest backward k-distance and evict that frame. Only frames
    * that are marked as 'evictable' are candidates for eviction.
    *
@@ -74,8 +66,6 @@ class LRUKReplacer {
   auto Evict(frame_id_t *frame_id) -> bool;
 
   /**
-   * TODO(P1): Add implementation
-   *
    * @brief Record the event that the given frame id is accessed at current timestamp.
    * Create a new entry for access history if frame id has not been seen before.
    *
@@ -87,8 +77,6 @@ class LRUKReplacer {
   void RecordAccess(frame_id_t frame_id);
 
   /**
-   * TODO(P1): Add implementation
-   *
    * @brief Toggle whether a frame is evictable or non-evictable. This function also
    * controls replacer's size. Note that size is equal to number of evictable entries.
    *
@@ -106,8 +94,6 @@ class LRUKReplacer {
   void SetEvictable(frame_id_t frame_id, bool set_evictable);
 
   /**
-   * TODO(P1): Add implementation
-   *
    * @brief Remove an evictable frame from replacer, along with its access history.
    * This function should also decrement replacer's size if removal is successful.
    *
@@ -125,8 +111,6 @@ class LRUKReplacer {
   void Remove(frame_id_t frame_id);
 
   /**
-   * TODO(P1): Add implementation
-   *
    * @brief Return replacer's size, which tracks the number of evictable frames.
    *
    * @return size_t
@@ -134,20 +118,30 @@ class LRUKReplacer {
   auto Size() -> size_t;
 
  private:
-  /** Per-frame bookkeeping: the retained access history and the evictable flag. */
-  struct FrameStatus {
-    /** Timestamps of the most recent accesses, oldest first. At most k_ entries are kept. */
-    std::deque<size_t> history_;
-    /** Whether the frame may be chosen as an eviction victim. */
+  /**
+   * @brief Per-frame bookkeeping: when it was accessed, and whether it may be evicted.
+   *
+   * history_ keeps at most the k most recent timestamps. Dropping older ones is what lets us
+   * compare "backward k-distance" as "now - history_.front()": once a frame has been accessed
+   * k times, front() is exactly the timestamp of its kth most recent access.
+   */
+  struct FrameEntry {
+    std::list<size_t> history_;  // access timestamps, newest last, at most k entries
     bool evictable_{false};
   };
 
+  /** Monotonically increasing logical clock, bumped on every RecordAccess. */
   size_t current_timestamp_{0};
+  /** Number of frames currently marked evictable, i.e. what Size() reports. */
   size_t curr_size_{0};
+  /** The maximum number of frames this replacer will be required to store. */
   size_t replacer_size_;
+  /** The k of LRU-K. */
   size_t k_;
-  std::unordered_map<frame_id_t, FrameStatus> frame_status_;
+  /** Protects every member of this class. */
   std::mutex latch_;
+  /** Every frame this replacer knows about, keyed by frame id. */
+  std::unordered_map<frame_id_t, FrameEntry> node_store_;
 };
 
 }  // namespace bustub

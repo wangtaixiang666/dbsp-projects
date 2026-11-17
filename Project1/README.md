@@ -39,7 +39,7 @@
 | `RecordAccess` | 追加当前时间戳；历史超过 K 条时弹出最旧一条，只保留 K 条 |
 | `SetEvictable` | 改变可淘汰状态，同步维护 `curr_size_`（可淘汰帧数） |
 | `Evict` | 在可淘汰帧中选出 victim 并移出替换器 |
-| `Remove` | 仅在可淘汰时移除；被 pin 住的帧不动 |
+| `Remove` | 要求帧处于可淘汰状态（未被 pin），否则 `BUSTUB_ASSERT` 中断 |
 | `Size` | 返回当前可淘汰帧数 |
 
 淘汰顺序（这是本题的核心）：
@@ -47,7 +47,7 @@
 1. 访问次数不足 K 次的帧，后向 K 距离为 **+∞**，优先级高于任何有限距离；
 2. 同为 +∞ 时，淘汰**最早一次访问**的帧（历史首元素时间戳最小）；
 3. 都有 K 次访问时，后向 K 距离最大者优先被淘汰，即保留的 K 条历史中**最旧时间戳最小**者——恰好就是历史首元素最小的帧；
-4. 时间戳相同则按 frame_id 升序打破平局，保证多次运行结果一致。
+4. 时间戳全局自增唯一，层级内不会出现并列，故淘汰结果唯一确定。
 
 ---
 
@@ -58,7 +58,7 @@
 
 `pool_size` 个物理帧 + `page_table_`（可扩展哈希表）+ `free_list_`（空闲帧）+ `replacer_`（LRU-K）。
 
-**取帧 `AcquireFrame`**：优先从 `free_list_` 取；空闲帧耗尽才向 replacer 要 victim。拿到 victim 后，若该页为脏页先 `WritePage` 落盘，再从 `page_table_` 删除旧映射。所有帧都被 pin 住时返回失败，上层接口返回 `nullptr`。
+**取帧**：`NewPage` 与 `FetchPage` 共用同一段逻辑——优先从 `free_list_` 取空闲帧，耗尽才向 `replacer_` 要 victim。帧被复用时，若原页为脏页先 `WritePage` 落盘，再从 `page_table_` 删除旧映射，避免旧页数据丢失或残留别名。所有帧都被 pin 住时返回 `nullptr`。
 
 | 接口 | 行为 |
 |---|---|
@@ -66,9 +66,8 @@
 | `FetchPage` | 命中则 `pin_count++` 并刷新访问历史；未命中则取帧、从磁盘读入、建映射、pin 住 |
 | `UnpinPage` | 页不在池中或 `pin_count <= 0` 返回 false；否则减 1，`is_dirty` 只置位不清零，归零时才设为可淘汰 |
 | `FlushPage` | 写回磁盘并清除脏位；不存在返回 false |
-| `FlushAllPages` | 遍历所有有效帧写回并清脏位 |
+| `FlushAllPages` | 遍历所有有效帧写回并清脏位，跳过 `INVALID_PAGE_ID` 的空帧 |
 | `DeletePage` | 未缓存视为已删除返回 true；仍被 pin 住返回 false；否则移除映射、`ResetMemory`、归还 `free_list_` |
-| `FlushAllPages` 顺序 | 跳过 `INVALID_PAGE_ID` 的帧，避免把空帧写脏 |
 
 两个容易出错的地方：脏位**只在 unpin 时由 `is_dirty` 参数置位**，且不能把已有的 `true` 覆盖成 `false`；淘汰脏页必须**先写回再清帧**，否则数据丢失。
 
@@ -89,3 +88,16 @@ make -j"$(nproc)" extendible_hash_table_test lru_k_replacer_test buffer_pool_man
 无参数运行即执行全部用例；也可用 `--gtest_filter=` 指定单个用例。
 
 > 若运行时偶发 `exit 139` 段错误，是 ASAN 与地址随机化冲突的已知问题，重跑即可；`sudo sysctl -w kernel.randomize_va_space=0` 可彻底消除。
+
+## 验证结果
+
+2026-11-17 于 WSL2 Ubuntu + Clang 14 实测，无参数运行全部用例：
+
+| 测试目标 | 用例数 | 结果 | 耗时 |
+|---|---|---|---|
+| `extendible_hash_table_test` | 12 | 全部通过 | 174 ms |
+| `lru_k_replacer_test` | 4 | 全部通过 | 53 ms |
+| `buffer_pool_manager_instance_test` | 13 | 全部通过 | 3156 ms |
+
+**合计 29 个用例，0 失败。** 三个测试各出现过一次首次启动的 `exit 139`，为上述 ASAN/ASLR 已知问题，重跑后稳定通过。
+

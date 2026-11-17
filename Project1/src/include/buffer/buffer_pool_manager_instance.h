@@ -177,18 +177,5 @@ class BufferPoolManagerInstance : public BufferPoolManager {
   }
 
   // TODO(student): You may add additional private members and helper functions
-
-  /**
-   * @brief Obtain a frame that can hold a page: take one from the free list first, otherwise
-   * ask the replacer to evict a frame. When an existing page is displaced, a dirty copy is
-   * written back to disk and its page table entry is dropped.
-   *
-   * The caller is responsible for re-initialising the returned frame's page metadata and
-   * for pinning it again. Caller must acquire latch_ before calling this function.
-   *
-   * @param[out] frame_id the frame that may be reused
-   * @return false if every frame is pinned, true otherwise
-   */
-  auto AcquireFrame(frame_id_t *frame_id) -> bool;
 };
 }  // namespace bustub
